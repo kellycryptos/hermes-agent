@@ -320,6 +320,8 @@ def _compaction_returning_history(history_for):
          None, _PREVIOUS),
         (_PRIOR_TURN + [{"role": "user", "content": _carrier()}, {"role": "assistant", "content": "Done."}],
          None, "Round-trip the ShapeIndex."),
+        (_PRIOR_TURN + [{"role": "user", "content": _carrier("[Thu 2026-11-05 10:00:00 IST] Round-trip the ShapeIndex.")},
+                        {"role": "assistant", "content": "Done."}], None, "Round-trip the ShapeIndex."),
         (_PRIOR_TURN + [{"role": "user", "content": _carrier(ask="")}], None, _PREVIOUS),
         (_PRIOR_TURN + [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]},
                         {"role": "assistant", "content": "Done."}], None, ""),
@@ -339,7 +341,7 @@ def _compaction_returning_history(history_for):
           {"role": "assistant", "content": "Done."}], None, f"{_PREVIOUS}\n[screenshot]"),
     ],
     ids=["no-compaction", "in-place-compaction", "rotation", "first-turn", "multimodal", "skips-scaffolding",
-         "skips-flagged-scaffolding", "compaction-carrier-ask", "skips-bare-summary", "image-only-stops-search",
+         "skips-flagged-scaffolding", "compaction-carrier-ask", "carrier-ask-timestamp", "skips-bare-summary", "image-only-stops-search",
          "strips-gateway-timestamp", "skips-replayed-steer", "skips-timestamped-steer", "skips-steer-text-part",
          "typed-ask-stamp", "unstamped-row-drops-memory-fence"],
 )
