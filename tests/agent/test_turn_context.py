@@ -332,10 +332,16 @@ def _compaction_returning_history(history_for):
                         {"role": "assistant", "content": "Ok."}], None, _PREVIOUS),
         (_PRIOR_TURN + [{"role": "user", "content": [{"type": "text", "text": "\n\n" + steer_user_row("use zstd")["content"]}]},
                         {"role": "assistant", "content": "Ok."}], None, _PREVIOUS),
+        # A multimodal turn's injected context is flattened into the stored row with the ask.
+        ([{"role": "user", "content": f"{_PREVIOUS}\n[screenshot]\n\nPLUGIN NOTE", "display_metadata": {"typed_ask": _PREVIOUS}},
+          {"role": "assistant", "content": "Done."}], None, _PREVIOUS),
+        ([{"role": "user", "content": f"{_PREVIOUS}\n[screenshot]\n<memory-context>\nlikes tea\n</memory-context>"},
+          {"role": "assistant", "content": "Done."}], None, f"{_PREVIOUS}\n[screenshot]"),
     ],
     ids=["no-compaction", "in-place-compaction", "rotation", "first-turn", "multimodal", "skips-scaffolding",
          "skips-flagged-scaffolding", "compaction-carrier-ask", "skips-bare-summary", "image-only-stops-search",
-         "strips-gateway-timestamp", "skips-replayed-steer", "skips-timestamped-steer", "skips-steer-text-part"],
+         "strips-gateway-timestamp", "skips-replayed-steer", "skips-timestamped-steer", "skips-steer-text-part",
+         "typed-ask-stamp", "unstamped-row-drops-memory-fence"],
 )
 def test_providers_get_what_the_person_last_asked(history, compaction, expected, monkeypatch):
     """A resumed process must tell providers what the last turn asked: a live process may have keyed
@@ -348,6 +354,34 @@ def test_providers_get_what_the_person_last_asked(history, compaction, expected,
     _build(agent, user_message="Now decode it back.", conversation_history=history)
 
     assert mm.on_turn_start.call_args.kwargs["previous_message"] == expected
+
+
+def test_a_merged_row_forgets_the_typed_ask_stamp():
+    """The stamp names one turn's text: once a consecutive-user merge folds more into the row,
+    ``previous_message`` must read the merged content, not half of it."""
+    from agent.agent_runtime_helpers import _merge_consecutive_users
+    from agent.turn_context import _previous_user_message_text
+
+    merged, _ = _merge_consecutive_users([
+        {"role": "user", "content": "first ask", "display_metadata": {"typed_ask": "first ask", "keep": 1}},
+        {"role": "user", "content": "second ask"},
+    ])
+    assert merged[0]["display_metadata"] == {"keep": 1}
+    assert _previous_user_message_text(merged) == "first ask\n\nsecond ask"
+
+
+def test_a_vetoed_turn_drops_its_typed_ask_stamp():
+    """A gateway note can stamp a multimodal turn before a ``pre_llm_call`` hook vetoes it; the vetoed
+    text must not survive in the stamp, where ``previous_message`` would hand it to memory providers."""
+    from types import SimpleNamespace
+    from agent.turn_context import _previous_user_message_text, _withhold_blocked_prompt
+
+    row = {"role": "user", "content": [{"type": "text", "text": "secret plan"}],
+           "display_metadata": {"typed_ask": "secret plan"}}
+    _withhold_blocked_prompt(SimpleNamespace(_session_db=None), row, row["content"])
+
+    assert "typed_ask" not in row["display_metadata"]
+    assert "secret plan" not in _previous_user_message_text([row, {"role": "assistant", "content": "x"}])
 
 
 def test_turn_without_author_clears_previous_bot_author():

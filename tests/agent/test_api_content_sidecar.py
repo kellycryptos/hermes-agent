@@ -606,6 +606,27 @@ class TestWireInvariant:
         replayed = _user_messages(_chat_requests(handler)[0])[0]["content"]
         assert replayed == history[0]["content"]
 
+    def test_previous_message_after_a_multimodal_turn_is_the_typed_ask(self, wire_env):
+        """The injected part is flattened into the stored row with the ask, so a resumed process (CLI
+        reload and gateway replay alike) must read ``previous_message`` from the typed-ask stamp, or
+        memory providers re-key recall on the plugin context and recalled memory."""
+        from gateway.run import _build_gateway_agent_history
+        from run_agent import AIAgent
+        from agent.turn_context import _previous_user_message_text
+        make_agent, handler, db, sid = wire_env
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+
+        with patch.object(AIAgent, "_model_supports_vision", return_value=True):
+            make_agent().run_conversation([{"type": "text", "text": "what is this"}, image],
+                                          conversation_history=[], task_id="t1")
+
+        sent = _user_messages(_chat_requests(handler)[0])[0]
+        assert "display_metadata" not in sent  # the stamp never reaches the wire
+        history = db.get_messages_as_conversation(sid)
+        assert "PLUGIN-CTX" in history[0]["content"]
+        assert _previous_user_message_text(history) == "what is this"
+        assert _previous_user_message_text(_build_gateway_agent_history(history)[0]) == "what is this"
+
 
 # ---------------------------------------------------------------------------
 # Review fixes: re-anchoring, MoA, in-place compaction backfill, override
@@ -1058,6 +1079,7 @@ class TestSessionRowExistsBeforePreflightCompaction:
             # Reload: the durable row carries the same parts the model saw.
             reloaded = [m for m in db.get_messages_as_conversation(sid) if m["role"] == "user"]
             assert reloaded[-1]["content"] == live
+            assert reloaded[-1]["display_metadata"]["typed_ask"] == "what is this"  # backfilled with the part
         finally:
             db.close()
 

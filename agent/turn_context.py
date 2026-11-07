@@ -15,11 +15,11 @@ import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Tuple
 
 from agent.conversation_compression import recover_rotated_compression_session
 from agent.iteration_budget import IterationBudget
-from agent.memory_context import build_memory_context_block
+from agent.memory_context import build_memory_context_block, sanitize_context
 from agent.memory_provider import is_trivial_prompt
 from agent.message_content import flatten_message_text
 from agent.lsp.deferred import forward_to_agent as forward_lsp_verdicts
@@ -28,6 +28,7 @@ from agent.skills_index_delta import stage_skills_index_note
 from agent.prompt_refresh import refresh_warm_prompt
 from agent.message_metadata import (
     PERSISTENCE_ONLY_MESSAGE_FIELDS, PRE_LLM_BLOCK_WITHHELD_PROMPT, append_message, stamp_message_timestamp,
+    drop_typed_ask, stamp_typed_ask, typed_ask_text,
 )
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
@@ -146,8 +147,10 @@ def substitute_api_content(api_msg: dict[str, Any]) -> Optional[str]:
 
 def drop_stale_api_content(msg: dict[str, Any]) -> None:
     """Drop the ``api_content`` sidecar from a message whose content was rewritten
-    (replaying it would resend what the rewrite removed; cost is one cache miss)."""
+    (replaying it would resend what the rewrite removed; cost is one cache miss), and its
+    typed-ask stamp, which names the ask of the content the rewrite replaced."""
     msg.pop("api_content", None)
+    drop_typed_ask(msg)
 
 
 def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Optional[str]:
@@ -180,6 +183,13 @@ def consume_surface_switch_note(agent: Any) -> str:
 def consume_skills_index_note(agent: Any) -> str:
     """Pop the skills-index delta staged by the system-prompt restore; same channel as above."""
     return _pop_turn_note(agent, "_skills_index_note")
+
+
+def _stamp_typed_ask_once(turn_user_msg: MutableMapping[str, Any]) -> None:
+    """Record the typed text of a multimodal turn before injected context is appended to its parts:
+    the persisted row flattens parts into one string, so ``previous_message`` reads the ask from here."""
+    if typed_ask_text(turn_user_msg) is None and isinstance(turn_user_msg.get("content"), list):
+        stamp_typed_ask(turn_user_msg, _memory_query_text(turn_user_msg["content"]))
 
 
 def append_notes_to_multimodal_content(content: Any, notes: Optional[str]) -> bool:
@@ -860,12 +870,12 @@ def _withhold_blocked_prompt(agent: Any, turn_user_msg: dict[str, Any], typed: A
     else:
         typed = _content_with_turn_override(turn_user_msg, content, typed)
         withheld = _content_with_turn_override(turn_user_msg, content, PRE_LLM_BLOCK_WITHHELD_PROMPT)
+    drop_stale_api_content(turn_user_msg)  # with the typed-ask stamp: the vetoed text never reaches providers
     metadata = turn_user_msg.get("display_metadata")
     metadata = {**(metadata if isinstance(metadata, dict) else {}), WITHHELD_PROMPT: str(_durable_content(typed) or "")}
     agent._persist_user_message_override = PRE_LLM_BLOCK_WITHHELD_PROMPT
     with _persist_lock(agent):
         turn_user_msg["content"] = withheld
-        turn_user_msg.pop("api_content", None)
         turn_user_msg["display_metadata"] = metadata
         _db = getattr(agent, "_session_db", None)
         _row_id = turn_user_msg.get("_row_id")
@@ -965,6 +975,7 @@ def _merge_gateway_notes(
         else None
     )
     if isinstance(_gw_turn_content, list):
+        _stamp_typed_ask_once(messages[current_turn_user_idx])
         append_notes_to_multimodal_content(_gw_turn_content, _turn_notes)
         return plugin_user_context
     return (
@@ -1006,8 +1017,10 @@ def _previous_user_message_text(conversation_history: Optional[list[Any]]) -> st
     wraps, and an image-only turn ends the search with ``""`` rather than falling back to an older ask.
     The value is the text of that turn's clean persisted ask, as a live process saw it: a gateway timestamp
     prefix comes off, and a mid-turn /steer row is skipped (gateway replay drops its type, so it is matched by
-    its marker). Best-effort: replay also drops the type of internal-notification rows, so one without a known
-    prefix (a cron delivery, a process heartbeat, a watch-disabled notice) can still be returned."""
+    its marker). A multimodal turn's injected context sits in its parts, so its typed ask is read from the
+    ``TYPED_ASK`` stamp (an older row without one has the memory fence stripped). Best-effort: replay also
+    drops the type of internal-notification rows, so one without a known prefix (a cron delivery, a process
+    heartbeat, a watch-disabled notice) can still be returned."""
     from agent.context_compressor import user_originated_turn_view
     from agent.conversation_compression_scaffolding import is_user_role_scaffolding
     from agent.prompt_builder import STEER_MARKER_OPEN
@@ -1023,7 +1036,10 @@ def _previous_user_message_text(conversation_history: Optional[list[Any]]) -> st
             continue
         # The canonical view cannot see metadata-flagged scaffolding, so screen it out first.
         if not is_user_role_scaffolding(message) and (live_view := user_originated_turn_view(message)) is not None:
-            return _memory_query_text(live_view.get("content"))
+            typed = typed_ask_text(message)
+            if typed is not None:
+                return typed
+            return sanitize_context(_memory_query_text(live_view.get("content"))).strip()
     return ""
 
 
@@ -1122,6 +1138,8 @@ def _append_multimodal_context(
     ``_row_id``-under-lock protocol as the string sidecar backfill; the row keeps its writer's
     shape (compaction inserted the raw parts, a flush the text projection)."""
     _mm_ctx = compose_multimodal_context_part(ext_prefetch_cache, plugin_user_context)
+    if _mm_ctx:
+        _stamp_typed_ask_once(turn_user_msg)
     if not append_notes_to_multimodal_content(turn_user_msg.get("content"), _mm_ctx):
         return
     from agent.session_persistence import _durable_content, _persist_lock
@@ -1134,7 +1152,7 @@ def _append_multimodal_context(
         _in_place_compacted = preflight_compressed and bool(getattr(agent, "_last_compaction_in_place", False))
         content = turn_user_msg["content"] if _in_place_compacted else _durable_content(turn_user_msg["content"])
         try:
-            _db.set_user_message_content(agent.session_id, _row_id, content)
+            _db.set_user_message_content(agent.session_id, _row_id, content, turn_user_msg.get("display_metadata"))
         except Exception:
             logger.warning("multimodal context backfill failed for session=%s", agent.session_id or "none", exc_info=True)
 

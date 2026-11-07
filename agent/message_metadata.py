@@ -81,6 +81,33 @@ WITHHELD_PROMPT = "withheld_prompt"
 PRE_LLM_BLOCK_WITHHELD_PROMPT = "[Message withheld: a pre_llm_call policy hook blocked it.]"
 
 
+# The text the person typed on a multimodal turn, kept inside ``display_metadata`` when the turn's injected
+# context (recalled memory, ``pre_llm_call`` and gateway notes) is appended to ``content`` as a text part:
+# the DB stores that content as one flattened string, so nothing else can tell the ask from the injection.
+TYPED_ASK = "typed_ask"
+
+
+def stamp_typed_ask(message: MutableMapping[str, Any], text: Any) -> None:
+    """Record *text* as *message*'s typed ask (no-op when it is not a string)."""
+    if isinstance(text, str):
+        metadata = message.get("display_metadata")
+        message["display_metadata"] = {**(metadata if isinstance(metadata, dict) else {}), TYPED_ASK: text}
+
+
+def drop_typed_ask(message: MutableMapping[str, Any]) -> None:
+    """Forget the typed-ask stamp on a row whose content now holds more than that one turn (a merge)."""
+    metadata = message.get("display_metadata")
+    if isinstance(metadata, dict) and TYPED_ASK in metadata:
+        message["display_metadata"] = {k: v for k, v in metadata.items() if k != TYPED_ASK}
+
+
+def typed_ask_text(message: Any) -> Optional[str]:
+    """The typed ask stamped on *message*, else None."""
+    metadata = message.get("display_metadata") if isinstance(message, Mapping) else None
+    text = metadata.get(TYPED_ASK) if isinstance(metadata, Mapping) else None
+    return text if isinstance(text, str) else None
+
+
 def withheld_prompt_text(message: Any) -> Optional[str]:
     """The typed text a transcript view shows for a vetoed user row, else None."""
     metadata = message.get("display_metadata") if isinstance(message, Mapping) else None
@@ -192,6 +219,15 @@ def scaffolding_replay_fields(msg: Mapping[str, Any]) -> dict:
     fields: dict = {"_compressed_summary": True} if msg.get("_compressed_summary") else {}
     if isinstance(metadata, dict) and metadata.get(INFLIGHT_TASK_RESTATEMENT):
         fields["display_metadata"] = {INFLIGHT_TASK_RESTATEMENT: True}
+    return fields
+
+
+def replay_metadata_fields(msg: Mapping[str, Any]) -> dict:
+    """``scaffolding_replay_fields`` plus a user row's typed-ask stamp: the replayed content holds the
+    flattened injected context of a multimodal turn, which ``previous_message`` must not read back."""
+    fields = scaffolding_replay_fields(msg)
+    if (typed := typed_ask_text(msg)) is not None and msg.get("role") == "user":
+        fields["display_metadata"] = {**fields.get("display_metadata", {}), TYPED_ASK: typed}
     return fields
 
 
